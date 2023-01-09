@@ -57,7 +57,7 @@ kvm_support () {
 kvm_install () { 
     if ! dpkg -l | egrep -q -i 'libvirt'
     then
-        sudo apt-get upgrade
+        sudo apt-get update
         sudo apt-get install qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils libguestfs-tools
         RET=$?
         if [[ "${RET}" -ne 0 ]] 
