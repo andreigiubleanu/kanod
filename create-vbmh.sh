@@ -20,6 +20,11 @@ set -eu
 
 set -a
 
+###############
+# PREREQUISITES
+###############
+
+
 NO_KVM_SUPPORT=2
 NO_KVM_INSTALL=3
 KVM_PERMISSIONS_ISSUES=4
@@ -124,9 +129,92 @@ kanod_kubectl_yq_prerequisites ()
     fi
 }
 
-create_log 
-kvm_support
-kvm_install
-kanod_pip3_prerequisites
-kanod_python_packages_prerequisites
-kanod_kubectl_yq_prerequisites 
+
+###############
+# VIRSH DOMAINS
+###############
+
+domain_destroy () {
+    vm=$(echo ${1:-vmok})
+    echo "Domain clean-up"
+    for domain in $(virsh list --name --state-running | grep "^${vm}-[0-9]*$") ; do
+        echo "- Delete domain ${domain}"
+        virsh destroy "${domain}"
+    done
+}
+
+domain_undefine () {
+    vm=$(echo ${1:-vmok})
+    for domain in $(virsh list --name --all | grep "^${vm}-[0-9]*$"); do
+        echo "- Undefine domain ${domain}"
+        virsh undefine "${domain}"
+    done
+}
+
+vol_delete () {
+    STORAGE_POOL=$(echo ${1:-okstore})
+    vol=$(echo ${2:-vol})
+    for volume in $(virsh vol-list "${STORAGE_POOL}" | awk '{print $1}' | grep "^${vol}-[0-9]*$"); do
+        echo "- Delete volume ${vol}"
+        virsh vol-delete "${volume}" "${STORAGE_POOL}"
+    done
+}
+
+
+TPM=0
+AIRGAP=0
+NB_VM=3
+DISK_SIZE='10G'
+STORAGE_POOL='okstore'
+
+create_domain()
+{
+    declare -a tpm
+    if [ "$TPM" == 1 ]; then
+        tpm=(--tpm 'backend.type=emulator,backend.version=2.0,model=tpm-tis')
+    fi
+
+    # shellcheck disable=SC2153
+    if [ "$AIRGAP" == 1 ]; then
+        airgap=',filterref.filter=kanod-airgap-mode'
+    else
+        airgap=''
+    fi
+
+    echo "VM Creation"
+    for ((i=1;i<=NB_VM;i++)); do
+        vol="vol-$i"
+        mac=$(printf "52:54:00:01:00:%02d" "${i}")
+        domain="vmok-$i"
+
+        echo "- Create volume ${vol} (size: ${DISK_SIZE:-10G})"
+        virsh vol-create-as "${STORAGE_POOL}" "$vol" "${DISK_SIZE:-10G}" --format raw
+
+        echo "- Create domain ${domain}"
+        virt-install --name "$domain" --memory 7000 --vcpu 2 \
+            --cpu host-passthrough --os-variant generic \
+            --disk "device=disk,vol=${STORAGE_POOL}/${vol},bus=virtio,format=raw" \
+            --pxe --noautoconsole \
+            --network "network=oknet,model=virtio,mac=${mac}${airgap}" \
+            "${tpm[@]}"
+    done
+
+    sleep 10
+
+    for ((i=1;i<=NB_VM;i++)); do
+        echo "Stop domain ${vmok-$i}"
+        virsh destroy "vmok-$i"
+    done
+}
+
+#create_log 
+# prerequisites install
+#kvm_support
+#kvm_install
+#kanod_pip3_prerequisites
+#kanod_python_packages_prerequisites
+#kanod_kubectl_yq_prerequisites
+#domain_destroy
+#domain_undefine
+#vol_delete
+
