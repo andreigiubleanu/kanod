@@ -32,10 +32,10 @@ NO_PIP3_INSTALL=5
 PYTHON_PACAKGES_PREREQUISITES_ERROR=6
 NO_KUBECTL=7
 NO_YQ=8
-
+NO_BMC_PROTOCOL=9
 
 create_log () {
-   LOG="${PWD}/create-vmbh-log-$(date +%s).log"
+   LOG="${PWD}/create-vmbh-prereq-log-$(date +%s).log"
    touch $LOG 
 }
 
@@ -134,6 +134,8 @@ kanod_kubectl_yq_prerequisites ()
 # VIRSH DOMAINS
 ###############
 
+# Domains and vols cleanup
+
 domain_destroy () {
     vm=$(echo ${1:-vmok})
     echo "Domain clean-up"
@@ -160,21 +162,26 @@ vol_delete () {
     done
 }
 
+# Domain creation
+# The following variables control the behaviour of the create_domain function
+# You can experiment with different settings for your infrastructure
 
 TPM=0
 AIRGAP=0
 NB_VM=3
 DISK_SIZE='10G'
-STORAGE_POOL='okstore'
+STORAGE_POOL='okstore' # if it doesn't exist, needs to be manually created before running this script
+MEMORY=7000
+VCPU=2
+NETWORK='oknet' # if it doesn't exist, needs to be manually created before running this script
 
-create_domain()
+create_domain ()
 {
     declare -a tpm
     if [ "$TPM" == 1 ]; then
         tpm=(--tpm 'backend.type=emulator,backend.version=2.0,model=tpm-tis')
     fi
 
-    # shellcheck disable=SC2153
     if [ "$AIRGAP" == 1 ]; then
         airgap=',filterref.filter=kanod-airgap-mode'
     else
@@ -188,14 +195,14 @@ create_domain()
         domain="vmok-$i"
 
         echo "- Create volume ${vol} (size: ${DISK_SIZE:-10G})"
-        virsh vol-create-as "${STORAGE_POOL}" "$vol" "${DISK_SIZE:-10G}" --format raw
+        virsh vol-create-as "${STORAGE_POOL:-okstore}" "$vol" "${DISK_SIZE:-10G}" --format raw
 
         echo "- Create domain ${domain}"
-        virt-install --name "$domain" --memory 7000 --vcpu 2 \
+        virt-install --name "$domain" --memory "${MEMORY:-7000}" --vcpu "${VCPU:-2}"  \
             --cpu host-passthrough --os-variant generic \
-            --disk "device=disk,vol=${STORAGE_POOL}/${vol},bus=virtio,format=raw" \
+            --disk "device=disk,vol=${STORAGE_POOL:-okstore}/${vol},bus=virtio,format=raw" \
             --pxe --noautoconsole \
-            --network "network=oknet,model=virtio,mac=${mac}${airgap}" \
+            --network "network=${NETWORK:-oknet},model=virtio,mac=${mac}${airgap}" \
             "${tpm[@]}"
     done
 
@@ -207,6 +214,136 @@ create_domain()
     done
 }
 
+
+#############
+# Virtual BMC
+#############
+
+# Virtual BMC creation
+# The following variables control the behaviour of the create_bmc function
+
+BMC_PROTOCOL=""
+BMC_PASSWORD=""
+create_bmc () {
+
+    if ! which htpasswd 
+    then
+        sudo apt install apache2-utils || true
+    fi 
+
+    [ -z $LABDIR ] && echo "Please specify the path for your lab directory creation: " && read LABDIR
+
+    if [ "${BMC_PROTOCOL}" = "ipmi" ]; then
+    vbmc_config="${LAB_DIR}/vbmc"
+
+    if [ -f "${vbmc_config}/vbmc.pid" ]; then
+        pid="$(cat "${vbmc_config}/vbmc.pid")"
+        if [ "$pid" != '0' ]; then
+        echo "Killing $pid"
+        kill -9 "$pid" || true
+        rm "${vbmc_config}/vbmc.pid"
+        fi
+    fi
+
+    rm -rf "$vbmc_config"
+    mkdir -p "$vbmc_config"
+    cat > "$vbmc_config/virtualbmc.conf" <<EOF
+    [default]
+    config_dir: ${vbmc_config}
+    pid_file: ${vbmc_config}/vbmc.pid
+    server_port: 51000
+    [log]
+    logfile: ${vbmc_config}/log.txt
+EOF
+
+    echo 'Launching vbmc'
+    # Why vbmc is using pyperclip ?
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+    export VIRTUALBMC_CONFIG="$vbmc_config/virtualbmc.conf"
+    # vbmcd # don't know what this is
+
+    while ! vbmc list &> /dev/null; do
+        echo -n .
+        sleep 1
+    done
+
+    for ((i=1;i<=NB_VM;i++)) do
+        port=$((5000+i))
+        domain="vmok-$i"
+        vbmc add --username root --password "${BMC_PASSWORD}" --port "${port}" "${domain}"
+        vbmc start "${domain}"
+    done
+
+    elif [ "${BMC_PROTOCOL}" = "redfish" ] || [ "${BMC_PROTOCOL}" = "redfish-virtualmedia" ]; then
+    echo 'Launching Virtual Redfish BMC'
+
+    vbmcredfish_config="${LAB_DIR}/vbmcredfish"
+
+    for ((i=1;i<=NB_VM;i++)); do
+        if [ -f "${vbmcredfish_config}/vbmcredfish-${i}.pid" ]; then
+        pid="$(cat "${vbmcredfish_config}/vbmcredfish-${i}.pid")"
+        if [ "$pid" != '0' ]; then
+            echo "Stopping sushy-emulator with pid ${pid}"
+            kill -9 "$pid" >& /dev/null || true
+            rm -f "${vbmcredfish_config}/vbmcredfish-${i}.pid"
+        fi
+        fi
+    done
+
+    set +e
+    pidlist=$(mktemp)
+    pgrep -a sushy-emulator  > "${pidlist}"
+    if [ -s "${pidlist}" ]; then
+        echo "!!! WARNING !!!"
+        echo "   Remaining sushy-emulator processus:"
+        cat "${pidlist}"
+    fi
+    rm "${pidlist}"
+    set -e
+
+    rm -rf "${vbmcredfish_config}"
+    mkdir -p "$vbmcredfish_config"
+
+    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+        -keyout  "${vbmcredfish_config}"/key.pem \
+        -out "${vbmcredfish_config}"/cert.pem \
+        -addext "subjectAltName = IP:${BMC_HOST}" \
+        -subj "/C=--/L=-/O=-/CN=${BMC_HOST}" &> /dev/null
+
+    for ((i=1;i<=NB_VM;i++)); do
+        port=$((5000+i))
+        vmName="vmok-$i"
+        allowedInstances=$(virsh list --all --name  --uuid | awk -v name=${vmName} '$2==name {print $2 "," $1}')
+        cat > "$vbmcredfish_config/emulator-${i}.conf" <<EOF
+    SUSHY_EMULATOR_LISTEN_IP = "${BMC_HOST}"
+    SUSHY_EMULATOR_LISTEN_PORT = "${port}"
+    SUSHY_EMULATOR_SSL_CERT = "${vbmcredfish_config}/cert.pem"
+    SUSHY_EMULATOR_SSL_KEY = "${vbmcredfish_config}/key.pem"
+    SUSHY_EMULATOR_AUTH_FILE = "${vbmcredfish_config}/htpasswd-${i}.txt"
+    SUSHY_EMULATOR_LIBVIRT_URI = u"qemu:///system"
+    SUSHY_EMULATOR_ALLOWED_INSTANCES = "${allowedInstances}"
+EOF
+
+        htpasswd -cbB "$vbmcredfish_config"/htpasswd-"${i}".txt root "${BMC_PASSWORD}" &> /dev/null
+
+        echo "Launching virtual redfish bmc on ${BMC_HOST}:${port} for ${vmName}"
+        SUSHY_EMULATOR_CONFIG="${ROOT_DIR}/redfish/sushy_extension.py" sushy-emulator --config "${vbmcredfish_config}"/emulator-"${i}".conf &> "${vbmcredfish_config}"/sushy-"${i}".log &
+
+        # shellcheck disable=SC2181
+        if [ $? -eq 0 ]; then
+            echo $! > "${vbmcredfish_config}/vbmcredfish-${i}.pid";
+        else
+            echo "Error during sushy-emulator launch"
+            exit 1
+        fi
+    done
+    else
+        echo "unknown protocol for bmc : ${BMC_PROTOCOL}"
+        exit "$NO_BMC_PROTOCOL"
+    fi
+}
+
+
 #create_log 
 # prerequisites install
 #kvm_support
@@ -217,4 +354,4 @@ create_domain()
 #domain_destroy
 #domain_undefine
 #vol_delete
-
+#create_domain
