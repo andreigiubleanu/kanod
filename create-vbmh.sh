@@ -16,7 +16,7 @@
 #    The script has been tested on Ubuntu systems, flavors 20.04 and up
 
 
-set -eu
+set -e
 
 set -a
 
@@ -24,7 +24,7 @@ set -a
 # PREREQUISITES
 ###############
 
-
+# exit codes
 NO_KVM_SUPPORT=2
 NO_KVM_INSTALL=3
 KVM_PERMISSIONS_ISSUES=4
@@ -85,7 +85,7 @@ kvm_install () {
     fi
 }
 
-kanod_pip3_prerequisites () {
+pip3_prerequisites () {
     if ! dpkg -l | egrep -q -i 'python3-pip'
     then
         sudo apt-get update
@@ -100,7 +100,7 @@ kanod_pip3_prerequisites () {
     fi
 }
 
-kanod_python_packages_prerequisites () {
+python_packages_prerequisites () {
     sudo pip3 install --upgrade pip
     sudo apt-get install -y debootstrap kpartx python3-wheel apache2-utils || \
     (echo "Unable to install some prerequisite utilities. Try to manually install them and rerun the script." | \
@@ -113,7 +113,7 @@ kanod_python_packages_prerequisites () {
     tee -a "${LOG}" && exit $PYTHON_PACAKGES_PREREQUISITES_ERROR)
 }
 
-kanod_kubectl_yq_prerequisites ()
+kubectl_yq_prerequisites ()
 {
     if ! which kubectl 
     then
@@ -129,10 +129,24 @@ kanod_kubectl_yq_prerequisites ()
     fi
 }
 
-
 ###############
 # VIRSH DOMAINS
 ###############
+
+# The following variables control the behaviour for the creation of domains, networks and storage
+# You can experiment with different settings for your infrastructure
+
+TPM=0
+AIRGAP=0
+NB_VM=3
+DISK_SIZE='10G'
+STORAGE_POOL='okstore'
+MEMORY=7000
+VCPU=2
+NETWORK='oknet'
+BRIDGE_NAME='virbr1'
+IP_ADDRESS='192.168.133.1'
+BMC_HOST='192.168.133.1'
 
 # Domains and vols cleanup
 
@@ -156,24 +170,43 @@ domain_undefine () {
 vol_delete () {
     STORAGE_POOL=$(echo ${1:-okstore})
     vol=$(echo ${2:-vol})
-    for volume in $(virsh vol-list "${STORAGE_POOL}" | awk '{print $1}' | grep "^${vol}-[0-9]*$"); do
-        echo "- Delete volume ${vol}"
-        virsh vol-delete "${volume}" "${STORAGE_POOL}"
-    done
+    if ! virsh pool-list --inactive  | tail -n +3 | grep -q "$STORAGE_POOL"
+    then
+        for volume in $(virsh vol-list "${STORAGE_POOL}" | awk '{print $1}' | grep "^${vol}-[0-9]*$"); do
+            echo "- Delete volume ${vol}"
+            virsh vol-delete "${volume}" "${STORAGE_POOL}"
+        done
+    fi
 }
 
-# Domain creation
-# The following variables control the behaviour of the create_domain function
-# You can experiment with different settings for your infrastructure
+# Domain, network and storage creation
 
-TPM=0
-AIRGAP=0
-NB_VM=3
-DISK_SIZE='10G'
-STORAGE_POOL='okstore' # if it doesn't exist, needs to be manually created before running this script
-MEMORY=7000
-VCPU=2
-NETWORK='oknet' # if it doesn't exist, needs to be manually created before running this script
+create_network ()
+{
+     if [[ $(virsh net-list | tail +3 | awk '{print $1}') =~ (^|[[:space:]])"${NETWORK}"($|[[:space:]]) ]]; then
+        echo 'Network already exists'
+     else
+        virsh net-define /dev/stdin <<EOF
+<network>
+<name>${NETWORK}</name>
+<forward mode='nat'/>
+<bridge name='${BRIDGE_NAME}' stp='on' delay='0'/>
+<ip address='${IP_ADDRESS}' netmask='255.255.255.0'>
+</ip>
+</network>
+EOF
+        virsh net-start "${NETWORK}"
+        virsh net-autostart "${BRIDGE_NAME}" 
+    fi   
+}
+
+create_storage () {
+    if ! [[ "$(virsh pool-list --name)" =~ "${STORAGE_POOL}" ]]; then
+        virsh pool-define-as --type dir --name "${STORAGE_POOL}" --target "/home/$(whoami)/${STORAGE_POOL}"
+        virsh pool-start "${STORAGE_POOL}"
+        virsh pool-autostart "${STORAGE_POOL}"
+    fi
+}
 
 create_domain ()
 {
@@ -214,16 +247,18 @@ create_domain ()
     done
 }
 
-
 #############
 # Virtual BMC
 #############
 
 # Virtual BMC creation
 # The following variables control the behaviour of the create_bmc function
+# You can choose between ipmi or redfish protocols
 
-BMC_PROTOCOL=""
-BMC_PASSWORD=""
+BMC_PROTOCOL="ipmi"
+BMC_PASSWORD="orange123."
+LAB_DIR=""
+
 create_bmc () {
 
     if ! which htpasswd 
@@ -231,127 +266,133 @@ create_bmc () {
         sudo apt install apache2-utils || true
     fi 
 
-    [ -z $LABDIR ] && echo "Please specify the path for your lab directory creation: " && read LABDIR
+    [ -z $LAB_DIR ] && echo "Please specify the path for your lab directory creation: " && read LAB_DIR
 
     if [ "${BMC_PROTOCOL}" = "ipmi" ]; then
-    vbmc_config="${LAB_DIR}/vbmc"
-
-    if [ -f "${vbmc_config}/vbmc.pid" ]; then
-        pid="$(cat "${vbmc_config}/vbmc.pid")"
-        if [ "$pid" != '0' ]; then
-        echo "Killing $pid"
-        kill -9 "$pid" || true
-        rm "${vbmc_config}/vbmc.pid"
+        vbmc_config="${LAB_DIR}/vbmc"
+        if [ -f "${vbmc_config}/vbmc.pid" ]; then
+            pid="$(cat "${vbmc_config}/vbmc.pid")"
+            if [ "$pid" != '0' ]; then
+            echo "Killing $pid"
+            kill -9 "$pid" || true
+            rm "${vbmc_config}/vbmc.pid"
+            fi
         fi
-    fi
 
-    rm -rf "$vbmc_config"
-    mkdir -p "$vbmc_config"
-    cat > "$vbmc_config/virtualbmc.conf" <<EOF
-    [default]
-    config_dir: ${vbmc_config}
-    pid_file: ${vbmc_config}/vbmc.pid
-    server_port: 51000
-    [log]
-    logfile: ${vbmc_config}/log.txt
+        rm -rf "$vbmc_config"
+        mkdir -p "$vbmc_config"
+        cat > "$vbmc_config/virtualbmc.conf" <<EOF
+[default]
+config_dir: ${vbmc_config}
+pid_file: ${vbmc_config}/vbmc.pid
+server_port: 51000
+[log]
+logfile: ${vbmc_config}/log.txt
 EOF
 
-    echo 'Launching vbmc'
-    # Why vbmc is using pyperclip ?
-    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
-    export VIRTUALBMC_CONFIG="$vbmc_config/virtualbmc.conf"
-    # vbmcd # don't know what this is
+        echo 'Launching vbmc'
+        # Why vbmc is using pyperclip ?
+        export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+        export VIRTUALBMC_CONFIG="$vbmc_config/virtualbmc.conf"
+        vbmcd # don't know what this is
 
-    while ! vbmc list &> /dev/null; do
-        echo -n .
-        sleep 1
-    done
+        while ! vbmc list &> /dev/null; do
+            echo -n .
+            sleep 1
+        done
 
-    for ((i=1;i<=NB_VM;i++)) do
-        port=$((5000+i))
-        domain="vmok-$i"
-        vbmc add --username root --password "${BMC_PASSWORD}" --port "${port}" "${domain}"
-        vbmc start "${domain}"
-    done
+        for ((i=1;i<=NB_VM;i++)) do
+            port=$((5000+i))
+            domain="vmok-$i"
+            vbmc add --username root --password "${BMC_PASSWORD}" --port "${port}" "${domain}"
+            vbmc start "${domain}"
+        done
+        # In order to run vbmc commands you need exprot VIRTUALBMC_CONFIG=${LAB_DIR}/vbmc/virtualbmc.conf 
+        # Afterwards you can run for example vbmc list
 
     elif [ "${BMC_PROTOCOL}" = "redfish" ] || [ "${BMC_PROTOCOL}" = "redfish-virtualmedia" ]; then
-    echo 'Launching Virtual Redfish BMC'
+        echo 'Launching Virtual Redfish BMC'
 
-    vbmcredfish_config="${LAB_DIR}/vbmcredfish"
+        vbmcredfish_config="${LAB_DIR}/vbmcredfish"
 
-    for ((i=1;i<=NB_VM;i++)); do
-        if [ -f "${vbmcredfish_config}/vbmcredfish-${i}.pid" ]; then
-        pid="$(cat "${vbmcredfish_config}/vbmcredfish-${i}.pid")"
-        if [ "$pid" != '0' ]; then
-            echo "Stopping sushy-emulator with pid ${pid}"
-            kill -9 "$pid" >& /dev/null || true
-            rm -f "${vbmcredfish_config}/vbmcredfish-${i}.pid"
+        for ((i=1;i<=NB_VM;i++)); do
+            if [ -f "${vbmcredfish_config}/vbmcredfish-${i}.pid" ]; then
+            pid="$(cat "${vbmcredfish_config}/vbmcredfish-${i}.pid")"
+            if [ "$pid" != '0' ]; then
+                echo "Stopping sushy-emulator with pid ${pid}"
+                kill -9 "$pid" >& /dev/null || true
+                rm -f "${vbmcredfish_config}/vbmcredfish-${i}.pid"
+            fi
+            fi
+        done
+
+        set +e
+        pidlist=$(mktemp)
+        pgrep -a sushy-emulator  > "${pidlist}"
+        if [ -s "${pidlist}" ]; then
+            echo "!!! WARNING !!!"
+            echo "   Remaining sushy-emulator processus:"
+            cat "${pidlist}"
         fi
-        fi
-    done
+        rm "${pidlist}"
+        set -e
 
-    set +e
-    pidlist=$(mktemp)
-    pgrep -a sushy-emulator  > "${pidlist}"
-    if [ -s "${pidlist}" ]; then
-        echo "!!! WARNING !!!"
-        echo "   Remaining sushy-emulator processus:"
-        cat "${pidlist}"
-    fi
-    rm "${pidlist}"
-    set -e
+        rm -rf "${vbmcredfish_config}"
+        mkdir -p "$vbmcredfish_config"
 
-    rm -rf "${vbmcredfish_config}"
-    mkdir -p "$vbmcredfish_config"
+        openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+            -keyout  "${vbmcredfish_config}"/key.pem \
+            -out "${vbmcredfish_config}"/cert.pem \
+            -addext "subjectAltName = IP:${BMC_HOST}" \
+            -subj "/C=--/L=-/O=-/CN=${BMC_HOST}" &> /dev/null
 
-    openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
-        -keyout  "${vbmcredfish_config}"/key.pem \
-        -out "${vbmcredfish_config}"/cert.pem \
-        -addext "subjectAltName = IP:${BMC_HOST}" \
-        -subj "/C=--/L=-/O=-/CN=${BMC_HOST}" &> /dev/null
-
-    for ((i=1;i<=NB_VM;i++)); do
-        port=$((5000+i))
-        vmName="vmok-$i"
-        allowedInstances=$(virsh list --all --name  --uuid | awk -v name=${vmName} '$2==name {print $2 "," $1}')
-        cat > "$vbmcredfish_config/emulator-${i}.conf" <<EOF
-    SUSHY_EMULATOR_LISTEN_IP = "${BMC_HOST}"
-    SUSHY_EMULATOR_LISTEN_PORT = "${port}"
-    SUSHY_EMULATOR_SSL_CERT = "${vbmcredfish_config}/cert.pem"
-    SUSHY_EMULATOR_SSL_KEY = "${vbmcredfish_config}/key.pem"
-    SUSHY_EMULATOR_AUTH_FILE = "${vbmcredfish_config}/htpasswd-${i}.txt"
-    SUSHY_EMULATOR_LIBVIRT_URI = u"qemu:///system"
-    SUSHY_EMULATOR_ALLOWED_INSTANCES = "${allowedInstances}"
+        for ((i=1;i<=NB_VM;i++)); do
+            port=$((5000+i))
+            vmName="vmok-$i"
+            allowedInstances=$(virsh list --all --name  --uuid | awk -v name=${vmName} '$2==name {print $2 "," $1}')
+            cat > "$vbmcredfish_config/emulator-${i}.conf" <<EOF
+SUSHY_EMULATOR_LISTEN_IP = "${BMC_HOST}"
+SUSHY_EMULATOR_LISTEN_PORT = "${port}"
+SUSHY_EMULATOR_SSL_CERT = "${vbmcredfish_config}/cert.pem"
+SUSHY_EMULATOR_SSL_KEY = "${vbmcredfish_config}/key.pem"
+SUSHY_EMULATOR_AUTH_FILE = "${vbmcredfish_config}/htpasswd-${i}.txt"
+SUSHY_EMULATOR_LIBVIRT_URI = u"qemu:///system"
+SUSHY_EMULATOR_ALLOWED_INSTANCES = "${allowedInstances}"
 EOF
 
-        htpasswd -cbB "$vbmcredfish_config"/htpasswd-"${i}".txt root "${BMC_PASSWORD}" &> /dev/null
+            htpasswd -cbB "$vbmcredfish_config"/htpasswd-"${i}".txt root "${BMC_PASSWORD}" &> /dev/null
 
-        echo "Launching virtual redfish bmc on ${BMC_HOST}:${port} for ${vmName}"
-        SUSHY_EMULATOR_CONFIG="${ROOT_DIR}/redfish/sushy_extension.py" sushy-emulator --config "${vbmcredfish_config}"/emulator-"${i}".conf &> "${vbmcredfish_config}"/sushy-"${i}".log &
+            echo "Launching virtual redfish bmc on ${BMC_HOST}:${port} for ${vmName}"
+            SUSHY_EMULATOR_CONFIG="${ROOT_DIR}/redfish/sushy_extension.py" sushy-emulator --config "${vbmcredfish_config}"/emulator-"${i}".conf &> "${vbmcredfish_config}"/sushy-"${i}".log &
 
-        # shellcheck disable=SC2181
-        if [ $? -eq 0 ]; then
-            echo $! > "${vbmcredfish_config}/vbmcredfish-${i}.pid";
-        else
-            echo "Error during sushy-emulator launch"
-            exit 1
-        fi
-    done
+            # shellcheck disable=SC2181
+            if [ $? -eq 0 ]; then
+                echo $! > "${vbmcredfish_config}/vbmcredfish-${i}.pid";
+            else
+                echo "Error during sushy-emulator launch"
+                exit 1
+            fi
+        done
     else
-        echo "unknown protocol for bmc : ${BMC_PROTOCOL}"
+        echo "Unknown protocol for bmc : ${BMC_PROTOCOL}"
         exit "$NO_BMC_PROTOCOL"
     fi
 }
 
-
-#create_log 
+# MAIN
+create_log 
 # prerequisites install
-#kvm_support
-#kvm_install
-#kanod_pip3_prerequisites
-#kanod_python_packages_prerequisites
-#kanod_kubectl_yq_prerequisites
-#domain_destroy
-#domain_undefine
-#vol_delete
-#create_domain
+kvm_support
+kvm_install
+pip3_prerequisites
+python_packages_prerequisites
+kubectl_yq_prerequisites
+# cleanup
+domain_destroy
+domain_undefine
+vol_delete "${STORAGE_POOL}"
+# objects creation
+create_network
+create_storage
+create_domain
+create_bmc
