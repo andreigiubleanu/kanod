@@ -13,7 +13,32 @@
 #    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
 #    License for the specific language governing permissions and limitations
 #    under the License.
-#    The script has been tested on Ubuntu systems, flavors 20.04 and up
+#
+#    The script has been tested on Ubuntu systems, flavors 20.04 and up.
+#    The  purpose of the script is to simulate remote management for virtual 
+#    machines ,thus treating them like bare metal hosts. In real life, you can 
+#    always access servers by using protocols such as IPMI, by interacting 
+#    with the baseboard management controller. In consequence, the script creates
+#    a controlled number of vms started in BIOS mode, and shuts them down.  
+#    By default, we simulate a BMC on each emulated server with python virtual BMC and IPMI. 
+#    The shell script creates a complete configuration for the vbmc daemon and launches it.
+#    The ports used start at 5001. We can list the declared BMC and their characteristics
+#    as follows(export the VIRTUALBMC_CONFIG variable and list the bmcs with the vbmc command):
+#    export VIRTUALBMC_CONFIG=<<path-to-your>>virtualbmc.conf    
+#    vbmc list
+#    +-------------+---------+---------+------+
+#    | Domain name | Status  | Address | Port |
+#    +-------------+---------+---------+------+
+#    | vmok-1      | running | ::      | 5001 |
+#    | vmok-2      | running | ::      | 5002 |
+#    | vmok-3      | running | ::      | 5003 |
+#    +-------------+---------+---------+------+
+#
+#    The script is done by reworking some assets from the Kanod and Kanod in
+#    a bottle projects. Kudos goes to all contributors of these projects.
+#    Please check the following links:
+#    https://gitlab.com/Orange-OpenSource/kanod/
+#    https://gitlab.com/Orange-OpenSource/kanod/kanod-in-a-bottle
 
 
 set -e
@@ -33,10 +58,30 @@ PYTHON_PACAKGES_PREREQUISITES_ERROR=6
 NO_KUBECTL=7
 NO_YQ=8
 NO_BMC_PROTOCOL=9
+UNSUPPORTED_OS=10
+UNSUPPORTED_UBUNTU_VERSION=11
+NO_APACHE2_UTILS=12
 
 create_log () {
    LOG="${PWD}/create-vmbh-prereq-log-$(date +%s).log"
    touch $LOG 
+}
+
+fail_fast () {
+    if ! egrep -q ubuntu /etc/os-release
+    then 
+        echo -e "Unsupported operating system.\n
+        Make sure you are running Ubuntu as your distro."  | tee -a "${LOG}" && exit "${UNSUPPORTED_OS}"
+    else
+        declare -a SUPPORTED_OS=(20.04 22.04)
+        OS_VERSION=$(cat /etc/os-release | awk -F"\"" '{print $1,$2}' | egrep VERSION_ID | awk -F " " '{print $2}')
+        if ! echo ${SUPPORTED_OS[@]} | grep -q -F "${OS_VERSION}"
+        then
+             echo -e "Make sure you are running the long time release branches for Ubuntu,\n
+                      so that you don't have trouble fetching the prerequisites.\n
+                      Accepted versions are: 20.04 and 22.04"  | tee -a "${LOG}"  && exit "${UNSUPPORTED_UBUNTU_VERSION}"
+        fi
+    fi
 }
 
 kvm_support () {
@@ -113,7 +158,7 @@ python_packages_prerequisites () {
     tee -a "${LOG}" && exit $PYTHON_PACAKGES_PREREQUISITES_ERROR)
 }
 
-kubectl_yq_prerequisites ()
+kubectl_yq_apache2-utils_prerequisites ()
 {
     if ! which kubectl 
     then
@@ -127,6 +172,11 @@ kubectl_yq_prerequisites ()
         (wget -q  https://github.com/mikefarah/yq/releases/download/v4.30.6/yq_linux_amd64 && sudo mv ./yq_linux_amd64 /usr/local/bin/yq) || \
         (echo "Unable to install yq. Try to manually install it and rerun the script." | tee -a "${LOG}" && exit $NO_YQ)
     fi
+    if ! which htpasswd 
+    then
+        sudo apt install apache2-utils ||\
+        echo "Unable to install apache2-utils. Try to manually install it and rerun the script." | tee -a "${LOG}" && exit $NO_APACHE2_UTILS
+    fi 
 }
 
 ###############
@@ -261,11 +311,6 @@ LAB_DIR=""
 
 create_bmc () {
 
-    if ! which htpasswd 
-    then
-        sudo apt install apache2-utils || true
-    fi 
-
     [ -z $LAB_DIR ] && echo "Please specify the path for your lab directory creation: " && read LAB_DIR
 
     if [ "${BMC_PROTOCOL}" = "ipmi" ]; then
@@ -307,7 +352,7 @@ EOF
             vbmc add --username root --password "${BMC_PASSWORD}" --port "${port}" "${domain}"
             vbmc start "${domain}"
         done
-        # In order to run vbmc commands you need exprot VIRTUALBMC_CONFIG=${LAB_DIR}/vbmc/virtualbmc.conf 
+        # In order to run vbmc commands you need to export VIRTUALBMC_CONFIG=${LAB_DIR}/vbmc/virtualbmc.conf 
         # Afterwards you can run for example vbmc list
 
     elif [ "${BMC_PROTOCOL}" = "redfish" ] || [ "${BMC_PROTOCOL}" = "redfish-virtualmedia" ]; then
@@ -381,16 +426,17 @@ EOF
 
 # MAIN
 create_log 
+fail_fast
 # prerequisites install
 kvm_support
 kvm_install
 pip3_prerequisites
 python_packages_prerequisites
-kubectl_yq_prerequisites
+kubectl_yq_apache2-utils_prerequisites
 # cleanup
 domain_destroy
 domain_undefine
-vol_delete "${STORAGE_POOL}"
+vol_delete
 # objects creation
 create_network
 create_storage
